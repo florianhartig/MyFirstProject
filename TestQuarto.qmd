@@ -31,5 +31,7 @@ plot(airquality)
 ```
 
 ```{r}
-hist(airquality$Ozone)
+hist(airquality$Ozone) # whiwer
 ```
+
+s
