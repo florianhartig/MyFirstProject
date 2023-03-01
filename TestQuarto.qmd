@@ -29,3 +29,7 @@ The `echo: false` option disables the printing of code (only output is displayed
 ```{r}
 plot(airquality)
 ```
+
+```{r}
+hist(airquality$Ozone)
+```
