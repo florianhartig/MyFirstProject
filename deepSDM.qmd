@@ -1,0 +1,402 @@
+---
+title: "Pipeline_dSDM_climatexbf_schön"
+author: "Melina Kienitz"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# This document provides you with a pipeline to build dSDMs with cito.
+
+## Butterfly data extraction
+
+I .. Occurrence data: make an account, download the collected data from 1995 (<https://registry.nbnatlas.org/public/showDataResource/dr2981>)
+
+Butterfly data from 1996, 392542 observations of 56 variables (downloaded 7thDezember2023)- most important variables need to be extracted and the structure needs to be transformed.
+
+The most important variables of this df are: Occurrence.status (present, one level), Scientific.name, start.date, start.date.day, Latitude..WGS84, Longitude..WGS84
+
+First variables were renamed to occ, species, date, occ.
+
+Then the presence data was transformed to p/a data: for every location where no butterflies per species was found the = 0(absent) and for every location where 1 or more butterflies per species were found = 1(present). -\> Since this data is gathered strategically, we can assume that a butterfly species was not found at every location of the uk where it was not counted.
+
+The data frame was then restructured so in the end I had the geolocation per species occurrence (lat, lon, sp1, sp2,....)
+
+### Function for butterfly data transformation
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+transform_bf_data <- function(input_df, output_file) {
+  # subset
+  df_names <- data.frame(
+    lat = input_df$Latitude..WGS84.,
+    lon = input_df$Longitude..WGS84.,
+    species = input_df$Scientific.name,
+    date = input_df$Start.date,
+    occ = 1
+  )
+
+  df_agg <- aggregate(occ ~ lat + lon + species, FUN = mean, data = df_names)
+
+  df_wide <- df_agg %>%
+    group_by(species, lat, lon) %>%
+    pivot_wider(names_from = species, values_from = occ, values_fill = 0)
+
+  output_df <- as.data.frame(df_wide)
+
+  return(output_df)
+}
+
+```
+
+### Data butterfly observations from 1996
+
+```{r}
+bf96 <- read.csv("data/bf96/bf96.csv")
+transformed_bf_data <- transform_bf_data(bf96)
+# save results
+#saveRDS(transformed_bf_data, file ="~/MSc-Internship-CNN-SDMs/data/transformed_bf96_data.RDS")
+
+```
+
+## Climate data
+
+Downloaded 10th January 2024
+
+Next I want to extract climatic variables for every geolocation of my bf data for 11 years.
+
+For that I use climatic variables: tmin, tmax, rainfall which I extracted daily for years 1986 to 1996.
+
+Test data set: My first goal is to get get to the same coordinate system. The bf df uses WGS84 and the climatic data uses transverse Mercator. There are two types of coordinate systems: geographic coordinate system (GCS) and the projected coordinate system (PCS). The GCS is 3D and the PCS 2D. For simplicity I will go with the tmerc so I do not need to transform the raster. I transformed coordinates and checked if values are aligning with the bf data set -- they do.
+
+Check fill values: Fillvalue is a value in this case of rainfall 1^20^ which is noticeable different from the rest of the values signaling that it is not a usable value for analysis. In R fillvalues are coded with NAs (<https://pjbartlein.github.io/REarthSysSci/netCDF.html)>
+
+### Climate data extraction for each coordinate in bf dataset
+
+I need to transform the crs of the butterfly data set to align it with that of the climate data. To do this it is important to only transform the bf data and not the raster otherwise you generate lots of NAs and it does weird things.
+
+After transforming and stacking all netcdf files for each variable seperatly I join them to one big array with dim(location,day,variable).
+
+#### Transform bf crs to tmerc and extract climate data for bf observations
+
+Read in your climate data and butterfly data
+
+Transform coordinates of bf data
+
+create stacked raster files for your netcdf files for each variable and then extract only climatic data for the butterfly observations.
+
+```{r}
+library(raster)
+library(ncdf4)
+library(sp)
+
+# read in files
+tmin_files <- list.files("~/MSc-Internship-CNN-SDMs/data/tmin1986_1996/", pattern = "*tasmin", full.names = TRUE)
+tmax_files <- list.files("~/MSc-Internship-CNN-SDMs/data/tmax1986_1996/", pattern = "*tasmax", full.names = TRUE)
+rain_files <- list.files("~/MSc-Internship-CNN-SDMs/data/rain1986_1996/", pattern = "*rainfall", full.names = TRUE)
+
+# read in butterfly coordinates
+coordinates <- readRDS("~/MSc-Internship-CNN-SDMs/data/transformed_bf96_data.RDS")
+#class(coordinates)
+# Transform bf coordinates from WGS84 to tmerc from climate data
+points <- SpatialPoints(coordinates[, c('lon', 'lat')],
+                        proj4string=CRS('+proj=longlat +datum=WGS84'))
+
+pts <- spTransform(points, CRS("+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +a=6377563.396 +rf=299.324961266495 +units=m +no_defs"))
+
+tmin_stack <- stack(tmin_files)
+tmax_stack <- stack(tmax_files)
+rain_stack <- stack(rain_files)
+
+tmin <- extract(tmin_stack, pts)
+tmax <- extract(tmax_stack, pts)
+rain <- extract(rain_stack, pts)
+
+
+# check NAs
+tmin[,113] # für tag 113
+tmin[113,] # für lokation 113
+# -> NAs are locationwide
+
+# remove NAs from climate and butterfly data based on NAs of climate data
+# since NAs are rowwise I will use tmin as reference for bf data
+complete_rows <- complete.cases(tmin)
+tmin_clean <- tmin[complete_rows, , drop = FALSE]
+tmax_clean <- tmax[complete.cases(tmax), ]
+rain_clean <- rain[complete.cases(rain), ]
+bf96_clean <- coordinates[complete_rows, , drop = FALSE]
+
+
+
+# columname extratction and sorting after days
+
+climate11xbf96 <- array(c(tmin_clean,tmax_clean,rain_clean), dim=(c(nrow(tmin_clean),3,ncol(tmin_clean)))) # array for CNN
+
+# save results
+#saveRDS(climate11xbf96, file = "~/MSc-Internship-CNN-SDMs/data/climate198696xbf96_cnn_withoutNAs.RDS")
+#saveRDS(bf96_clean, file = "~/MSc-Internship-CNN-SDMs/data/bf96_withoutNAs.RDS")
+write.csv(bf96_clean, file = "~/MSc-Internship-CNN-SDMs/data/test.csv")
+```
+
+### Data Prep for DNN
+
+I want a summary statistic for my DNN
+
+```{r}
+summarize_matrix <- function(matrix_input) {
+  summary_values <- apply(matrix_input, 1, function(row) c(
+    mean(row),
+    IQR(row)
+  ))
+  return(as.matrix(t(summary_values)))
+}
+
+
+sum_tmin <- summarize_matrix(climate11xbf96[,1,])
+sum_tmax <- summarize_matrix(climate11xbf96[,2,])
+sum_rain <- summarize_matrix(climate11xbf96[,3,])
+
+climate_summary <- cbind(sum_tmin, sum_tmax, sum_rain)
+
+#saveRDS(climate_summary, file = "~/MSc-Internship-CNN-SDMs/data/1986_96_climate_summary_meanIQRsd_dnn.RDS")
+
+```
+
+## Model Fitting
+
+```{r}
+result = data.frame(Method = "Test", AUC = NA)
+```
+
+### Reading in Data & Libraries for CNN DNN RF
+
+```{r}
+library(cito) #CNN&DNN
+library(ranger) #RF
+library(torchvision)
+
+bf <- readRDS(file = "~/MSc-Internship-CNN-SDMs/data/bf96_withoutNAs.RDS")
+
+
+climate11_cnn <- readRDS(file = "~/MSc-Internship-CNN-SDMs/data/climate198696xbf96_cnn_withoutNAs.RDS")
+climate_sum <- readRDS(file = "~/MSc-Internship-CNN-SDMs/data/1986_96_climate_summary_meanIQRsd_dnn.RDS")
+
+```
+
+Split the data into training and testing sets for CNN, DNN, RF
+
+```{r}
+set.seed(42)  # Set a seed for reproducibility
+
+# CNN
+X<- climate11_cnn
+X <- (X)/max(X)
+X<- array(X, dim = c(16935, 3, 4018))
+
+Y<- factor(bf$`Aglais io`)
+
+
+# Split the data into training and testing sets
+split_idx <- sample(1:dim(X)[1], round(0.8 * dim(X)[1]))  # 80% training, 20% testing
+X_train <- X[split_idx, , ,  drop = FALSE]
+Y_train <- Y[split_idx]
+X_test <- X[-split_idx, , ,  drop = FALSE]
+Y_test <- Y[-split_idx]
+
+#DNN
+
+climate_sum_scaled <- (climate_sum)/max(climate_sum) # scale features
+C <- cbind(bf$`Aglais io`, climate_sum_scaled)
+
+# subset your data
+splitdnn_idx <- sample(1:dim(C)[1], round(0.8 * dim(C)[1]))  # 80% training, 20% testing  #
+A_train <- C[splitdnn_idx, ,  drop = FALSE]
+A_test <- C[-splitdnn_idx, ,  drop = FALSE]
+
+# RF
+rf_train = data.frame(A_train)
+rf_train$X1 = as.factor(rf_train$X1)
+```
+
+### RF
+
+```{r}
+
+rf = ranger(X1~., data = rf_train, probability = TRUE)
+
+```
+
+### DNN
+
+```{r}
+# best model high batch size with high lr & many epochs
+nn.fit<- dnn(X1~., data = A_train, loss = "binomial",        epochs = 1000, hidden = c(100L, 100L), validation = 0.1, lr = 1, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 2000L, device = "cuda")
+
+# small hidden layers
+nn.fit2 <- dnn(X1~., data = A_train, loss = "binomial", epochs = 1000, hidden = c(10L, 10L), validation = 0.1, lr = 1, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 2000L, device = "cuda")
+
+# loow batch size
+nn.fit3 <- dnn(X1~., data = A_train, loss = "binomial",        epochs = 1000, hidden = c(100L, 100L), validation = 0.1, lr = 1, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 200L, device = "cuda")
+
+# high lr
+nn.fit4 <- dnn(X1~., data = A_train, loss = "binomial", epochs = 1000, hidden = c(100, 100L), validation = 0.1, lr = 2, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 2000L, device = "cuda")
+
+# low lr
+nn.fit5 <- dnn(X1~., data = A_train, loss = "binomial", epochs = 1000, hidden = c(100, 100L), validation = 0.1, lr = 2, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 2000L, device = "cuda")
+
+# low ephochs
+nn.fit6 <- dnn(X1~., data = A_train, loss = "binomial",        epochs = 100, hidden = c(100L, 100L), validation = 0.1, lr = 1, lr_scheduler = config_lr_scheduler('reduce_on_plateau', factor = 0.8, patience = 10), batchsize = 2000L, device = "cuda")
+
+```
+
+Vieles verändert wie lr, hidden, lr_sheduler, batchsize....
+
+beste combination: hohe batch size mit hoher lr & vielen epochs
+
+#### Data Prep for CNN
+
+```{r}
+
+architecture <- create_architecture(conv(n_kernels = 8, kernel_size = 100), 
+                                    conv(n_kernels = 16, kernel_size = 100),
+                                    conv(n_kernels = 12, kernel_size = 50),
+                                    conv(n_kernels = 32, kernel_size = 10),
+                                    conv(n_kernels = 3, kernel_size = 30),
+                                    linear(n_neurons = 100),
+                                    default_dropout = list(linear=0.2, conv=0.1),
+                                    default_normalization = list(linear=TRUE, conv=TRUE),
+                                    default_activation = "selu",
+                                    default_padding = list(conv = 1, maxPool = 0, avgPool = 0))
+
+
+cnn.fit <- cnn(X_train, as.integer(Y_train)-1,
+               architecture, loss = "binomial",
+               epochs = 200,
+               validation = 0.1,
+               lr = 0.03,
+               batchsize = 1000L,
+               device = "cuda") # auc 0.7027
+
+# high epochs
+cnn.fit2 <- cnn(X_train, as.integer(Y_train)-1,
+               architecture, loss = "binomial",
+               epochs = 1000,
+               validation = 0.1,
+               lr = 0.03,
+               batchsize = 1000L,
+               device = "cuda",
+               plot = FALSE) 
+
+# high lr
+cnn.fit3 <- cnn(X_train, as.integer(Y_train)-1,
+               architecture, loss = "binomial",
+               epochs = 200,
+               validation = 0.1,
+               lr = 1,
+               batchsize = 1000L,
+               device = "cuda",
+               plot = FALSE) 
+
+# low batch size
+cnn.fit4 <- cnn(X_train, as.integer(Y_train)-1,
+               architecture, loss = "binomial",
+               epochs = 200,
+               validation = 0.1,
+               lr = 0.03,
+               batchsize = 200L,
+               device = "cuda",
+               plot = FALSE) 
+```
+
+## Save Models as RD
+
+```{r}
+
+saveRDS(rf, file = "~/MSc-Internship-CNN-SDMs/data/rf.RDS")
+
+saveRDS(nn.fit, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit.RDS")
+saveRDS(nn.fit2, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit2.RDS")
+saveRDS(nn.fit3, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit3.RDS")
+saveRDS(nn.fit4, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit4.RDS")
+saveRDS(nn.fit5, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit5.RDS")
+saveRDS(nn.fit6, file = "~/MSc-Internship-CNN-SDMs/data/nn.fit6.RDS")
+
+saveRDS(cnn.fit, file = "~/MSc-Internship-CNN-SDMs/data/cnn.fit.RDS")
+saveRDS(cnn.fit2, file = "~/MSc-Internship-CNN-SDMs/data/cnn.fit2.RDS")
+saveRDS(cnn.fit3, file = "~/MSc-Internship-CNN-SDMs/data/cnn.fit3.RDS")
+saveRDS(cnn.fit4, file = "~/MSc-Internship-CNN-SDMs/data/cnn.fit4.RDS")
+```
+
+### Training analysis comparison
+
+```{r}
+training_performance <- c(rf, nn.fit, nn.fit2, nn.fit3, nn.fit4, nn.fit5, nn.fit6, cnn.fit, cnn.fit2, cnn.fit3, cnn.fit4) 
+
+analyze_training(training_performance)
+
+```
+
+## Predictions
+
+```{r}
+
+library(Metrics)
+# RF
+predictions_rf = predict(rf, data = data.frame(A_test))$predictions
+rf_result = auc(A_test[,1], predictions_rf[,2])
+
+# DNN
+# Make predictions on the test set
+predictions_dnn <- predict(nn.fit, newdata = data.frame(A_test), type = "link")
+nn.fit_result = auc(A_test[,1], predictions_dnn)
+
+predictions_dnn2 <- predict(nn.fit2, newdata = data.frame(A_test), type = "link")
+nn.fit2_result = auc(A_test[,1], predictions_dnn2)
+
+predictions_dnn3 <- predict(nn.fit3, newdata = data.frame(A_test), type = "link")
+nn.fit3_result = auc(A_test[,1], predictions_dnn3)
+
+predictions_dnn4 <- predict(nn.fit4, newdata = data.frame(A_test), type = "link")
+nn.fit4_result = auc(A_test[,1], predictions_dnn4)
+
+predictions_dnn5 <- predict(nn.fit5, newdata = data.frame(A_test), type = "link")
+nn.fit5_result = auc(A_test[,1], predictions_dnn5)
+
+predictions_dnn6 <- predict(nn.fit6, newdata = data.frame(A_test), type = "link")
+nn.fit6_result = auc(A_test[,1], predictions_dnn6)
+
+# CNN
+# Make predictions on the test set
+predictions_cnn <- predict(cnn.fit, newdata = X_test, type = "link")
+cnn.fit_result = auc(Y_test, predictions_cnn)
+
+predictions_cnn2 <- predict(cnn.fit2, newdata = X_test, type = "link")
+cnn.fit_result2 = auc(Y_test, predictions_cnn2)
+
+predictions_cnn3 <- predict(cnn.fit3, newdata = X_test, type = "link")
+cnn.fit_result3 = auc(Y_test, predictions_cnn3)
+
+predictions_cnn4 <- predict(cnn.fit4, newdata = X_test, type = "link")
+cnn.fit_result4 = auc(Y_test, predictions_cnn4)
+
+result_method = c("rf", "nn.fit", "nn.fit2", "nn.fit3", "nn.fit4", "nn.fit5", "nn.fit6", "cnn.fit", "cnn.fit2", "cnn.fit3", "cnn.fit4")
+
+result_auc = c(rf_result, nn.fit_result, nn.fit2_result, nn.fit3_result, nn.fit4_result, nn.fit5_result, nn.fit6_result, cnn.fit_result, cnn.fit_result2,cnn.fit_result3, cnn.fit_result4)
+
+```
+
+# Method comparison
+
+barplot mit AUC der verschiedenen Methoden, könnte auch mehrere Variante pro Modellklasse zeigen
+
+```{r}
+result = data.frame(Method = result_method, AUC = result_auc)
+
+```
+
+```{r}
+sessionInfo()
+```
